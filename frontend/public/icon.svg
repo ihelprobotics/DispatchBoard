@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="DispatchBoard">
+  <rect width="512" height="512" rx="96" fill="#1b1b1b" />
+  <rect x="96" y="116" width="320" height="56" rx="28" fill="#f6f2ea" />
+  <rect x="96" y="216" width="320" height="56" rx="28" fill="#c25e2b" />
+  <rect x="96" y="316" width="320" height="56" rx="28" fill="#cfe9d5" />
+</svg>
