@@ -1,11 +1,49 @@
+# Environment files (keep examples)
 .env
-mcp-server/
+.env.*
+!.env.example
+!.env.*.example
+
+# Node / package managers
 node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# Editors / OS
 .vscode/
-supabase/
-DispatchBoard_Engineering_Spec_v1.docx
-.env.local
-sql/
-fwdbase/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Next.js / Vercel
 .next/
-# Build/time generated
+out/
+.vercel/
+
+# Build outputs
+dist/
+**/dist/
+
+# Local tooling
+.turbo/
+coverage/
+
+# Database / local state
+*.sqlite
+*.sqlite3
+
+# Large binary/docs (keep out of repo)
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+
+# Project-specific scratch
+mcp-server/
+fwdbase/
