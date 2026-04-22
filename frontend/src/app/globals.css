@@ -1,0 +1,43 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  color: #101827;
+  background: radial-gradient(circle at top left, #eef4ff 0%, #f3f5f9 40%, #e7edf5 100%);
+  font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+}
+
+.board-grid {
+  grid-template-columns: repeat(5, minmax(220px, 1fr));
+}
+
+@media (min-width: 1600px) {
+  .board-grid {
+    grid-template-columns: repeat(5, minmax(260px, 1fr));
+  }
+}
+
+@media (min-width: 1920px) {
+  .board-grid {
+    grid-template-columns: repeat(5, minmax(300px, 1fr));
+  }
+}
+
+@media (max-width: 1024px) {
+  .board-grid {
+    grid-template-columns: repeat(2, minmax(220px, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .board-grid {
+    grid-template-columns: 1fr;
+  }
+}
