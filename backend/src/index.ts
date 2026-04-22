@@ -1456,6 +1456,7 @@ app.post("/api/_twilio-webhook-old", async (req, res) => {
 
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_AUTH || "").trim();
 const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID || "").trim();
+const TWILIO_WHATSAPP_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim(); // e.g. "whatsapp:+14155238886"
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim().replace(/\/+$/, "");
 const TWILIO_DEBUG = process.env.TWILIO_DEBUG === "true";
 const DEBUG_ENDPOINTS = process.env.DEBUG_ENDPOINTS === "true";
@@ -1499,6 +1500,42 @@ function formatChatTimestamp(d: Date): string {
 
 function logChatLine(who: string, message: string, at: Date = new Date()) {
   console.log(`${formatChatTimestamp(at)} ${who}: ${message}`);
+}
+
+function extractWhatsAppFromNotes(notes: string | null | undefined): string {
+  const n = String(notes || "");
+  const m = n.match(/\bWA_FROM\s*[:=]\s*(whatsapp:\+\d{6,16})\b/i);
+  return m?.[1] ? m[1] : "";
+}
+
+async function sendWhatsAppMessage(to: string, body: string): Promise<boolean> {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) return false;
+  const dest = (to || "").trim();
+  if (!dest) return false;
+
+  const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  const params = new URLSearchParams();
+  params.set("To", dest);
+  params.set("From", TWILIO_WHATSAPP_FROM);
+  params.set("Body", body);
+
+  const res = await fetchWithTimeout(
+    `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: params.toString()
+    },
+    15_000
+  );
+  if (!res.ok) {
+    if (TWILIO_DEBUG) console.warn(`Twilio send failed: HTTP ${res.status}`);
+    return false;
+  }
+  return true;
 }
 
 function buildTwilioSignature(authToken: string, url: string, params: Record<string, string>): string {
@@ -1878,16 +1915,18 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
     if (docMeta.orderIds.length) metaNotes.push(`OrderId: ${docMeta.orderIds[0]}`);
     if (docMeta.invoiceNos.length) metaNotes.push(`Invoice: ${docMeta.invoiceNos[0]}`);
     if (docMeta.awbs.length) metaNotes.push(`AWB: ${docMeta.awbs[0]}`);
+    if (from) metaNotes.push(`WA_FROM:${from}`);
+    if (profileName) metaNotes.push(`WA_NAME:${profileName}`);
     await insertOrder(result, "whatsapp", metaNotes.length ? metaNotes.join(" | ") : undefined);
 
-    const itemsSummary = result.validItems.map((i) => `${i.qty}x ${i.sku}`).join(", ");
+    const itemsSummary = result.validItems.map((i) => `- ${i.qty} x ${i.sku}`).join("\n");
     const priorityTag =
       result.priority === "urgent" ? " [URGENT]" :
       result.priority === "high" ? " [HIGH]" : "";
     const reviewNote = result.needsReview ? "\nOur team will verify and confirm shortly." : "";
 
     return xmlReply(
-      `✅ Order received for ${result.customerName}: ${itemsSummary}${priorityTag}.${reviewNote}\n` +
+      `✅ Order received for ${result.customerName}:\n${itemsSummary}${priorityTag}.${reviewNote}\n` +
       `Tracking will be shared when shipped.`
     );
   } catch (err) {
@@ -1904,6 +1943,69 @@ if (DEBUG_ENDPOINTS) {
     res.json({ ok: true, last: lastTwilioWebhookDebug });
   });
 }
+
+app.post("/api/notify-status-change", async (req, res) => {
+  const { order_id, prev_status, new_status, awb, courier } = req.body as {
+    order_id?: string;
+    prev_status?: string;
+    new_status?: string;
+    awb?: string;
+    courier?: string;
+  };
+  if (!order_id || !new_status) return res.status(400).json({ ok: false, error: "order_id and new_status are required" });
+
+  const prev = String(prev_status || "").trim().toLowerCase();
+  const next = String(new_status || "").trim().toLowerCase();
+
+  const isShipmentTransition =
+    next === "shipped" && prev !== "shipped";
+  const isDoneTransition =
+    next === "done" && prev !== "done";
+
+  if (!isShipmentTransition && !isDoneTransition) {
+    return res.json({ ok: true, skipped: "transition_not_notified" });
+  }
+
+  const client = await pool.connect();
+  try {
+    const q = await client.query(
+      `select o.id, o.channel, o.notes, c.name as customer_name
+       from orders o
+       join customers c on c.id = o.customer_id
+       where o.id = $1`,
+      [order_id]
+    );
+    const row = q.rows[0] as any;
+    if (!row) return res.status(404).json({ ok: false, error: "order not found" });
+
+    const to = extractWhatsAppFromNotes(row.notes);
+    if (!to) return res.json({ ok: true, skipped: "no_whatsapp_contact" });
+
+    const customerName = String(row.customer_name || "").trim() || "Customer";
+
+    let message = "";
+    if (isShipmentTransition) {
+      const awbStr = (awb || "").trim();
+      const courierStr = (courier || "").trim();
+      const parts = [`📦 Update: Your order for ${customerName} is now in Shipment.`];
+      if (awbStr) parts.push(`AWB: ${awbStr}`);
+      if (courierStr) parts.push(`Courier: ${courierStr}`);
+      message = parts.join("\n");
+    } else if (isDoneTransition) {
+      message = `✅ Update: Your order for ${customerName} is marked Done. Thank you.`;
+    }
+
+    if (!message) return res.json({ ok: true, skipped: "no_message" });
+
+    const sent = await sendWhatsAppMessage(to, message);
+    return res.json({ ok: sent });
+  } catch (err) {
+    console.error("notify-status-change error:", err);
+    return res.status(500).json({ ok: false, error: "internal error" });
+  } finally {
+    client.release();
+  }
+});
 
 app.post("/api/parse-message", async (req, res) => {
   const { text } = req.body as { text?: string };

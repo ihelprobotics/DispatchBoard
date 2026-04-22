@@ -503,6 +503,19 @@ export function Board({ tvMode }: { tvMode: boolean }) {
   /* ── Offline queue init ── */
   useEffect(() => { setQueued(readQueue()); }, []);
 
+  const notifyStatusChange = useCallback(async (payload: { order_id: string; prev_status?: Order["status"]; new_status: Order["status"]; awb?: string; courier?: string }) => {
+    try {
+      const url = (process.env.NEXT_PUBLIC_INTAKE_API_URL ?? "http://localhost:4000");
+      await fetch(`${url}/api/notify-status-change`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      // best-effort
+    }
+  }, []);
+
   /* ── Online flush ── */
   useEffect(() => {
     const flush = async () => {
@@ -520,6 +533,9 @@ export function Board({ tvMode }: { tvMode: boolean }) {
             const { error: e } = await supabase.from("orders")
               .update({ status: action.status }).eq("id", action.orderId);
             if (e) throw e;
+            if (action.status === "shipped" || action.status === "done") {
+              await notifyStatusChange({ order_id: action.orderId, new_status: action.status });
+            }
           }
           if (action.type === "ship_partial") {
             const { error: e } = await supabase.rpc("ship_partial", {
@@ -529,6 +545,12 @@ export function Board({ tvMode }: { tvMode: boolean }) {
               p_courier: action.payload.courier,
             });
             if (e) throw e;
+            await notifyStatusChange({
+              order_id: action.payload.orderId,
+              new_status: "shipped",
+              awb: action.payload.awb ?? undefined,
+              courier: action.payload.courier ?? undefined,
+            });
           }
         } catch { remaining.push(action); }
       }
@@ -538,7 +560,7 @@ export function Board({ tvMode }: { tvMode: boolean }) {
     };
     window.addEventListener("online", flush);
     return () => window.removeEventListener("online", flush);
-  }, [reload]);
+  }, [reload, notifyStatusChange]);
 
   const enqueue = (action: QueueAction) => {
     const updated = [...readQueue(), action];
@@ -563,6 +585,9 @@ export function Board({ tvMode }: { tvMode: boolean }) {
     setError(null);
     const { error: e } = await supabase.from("orders").update({ status: target }).eq("id", order.id);
     if (e) { enqueue({ type: "update_status", orderId: order.id, status: target }); setError("Offline — queued."); return; }
+    if (target === "shipped" || target === "done") {
+      await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: target });
+    }
     reload();
   };
 
@@ -590,6 +615,13 @@ export function Board({ tvMode }: { tvMode: boolean }) {
       setError("Offline — queued fulfillment.");
       return;
     }
+    await notifyStatusChange({
+      order_id: fulfillment.order.id,
+      prev_status: fulfillment.order.status,
+      new_status: "shipped",
+      awb: fulfillment.awb || undefined,
+      courier: fulfillment.courier || undefined,
+    });
     setFulfillment(null);
     reload();
   };
