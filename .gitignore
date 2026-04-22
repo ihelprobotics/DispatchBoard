@@ -1,35 +1,51 @@
-# Dependencies
+# Environment files (keep examples)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Node / package managers
 node_modules/
-**/node_modules/
-
-# Next.js
-.next/
-**/.next/
-out/
-
-# Backend builds
-backend/dist/
-**/dist/
-
-# Logs
-*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+.pnpm-store/
 
-# Env files / secrets
-.env
-.env.*
-!.env.example
-backend/.env
-frontend/.env.local
-frontend/.env.*.local
-
-# OS / editor
+# Editors / OS
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
-.vscode/
 
-# PDFs and local artifacts
+# Next.js / Vercel
+.next/
+out/
+.vercel/
+
+# Build outputs
+dist/
+**/dist/
+
+# Local tooling
+.turbo/
+coverage/
+
+# Database / local state
+*.sqlite
+*.sqlite3
+
+# Large binary/docs (keep out of repo)
 *.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+!docs/*.docx
+!docs/**/*.docx
+
+# Project-specific scratch
+mcp-server/
+fwdbase/
