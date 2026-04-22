@@ -1,6 +1,6 @@
 import { PDFParse } from "pdf-parse";
-import { matchSku } from "./sku-map";
-import type { ParsedOrder } from "./types";
+import { matchSku } from "./sku-map.js";
+import type { ParsedOrder } from "./types.js";
 
 const PRICE_QUANTITY_REGEX = /₹[\d,]+(?:\.\d+)?\s+(\d+)\s+₹/;
 

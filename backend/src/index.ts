@@ -280,6 +280,13 @@ function sanitiseProductFragment(fragment: string): string {
     .trim();
 }
 
+function isNonProductChargeText(text: string): boolean {
+  const t = String(text || "").toLowerCase();
+  return /\b(handling(\s+fee)?|shipping|delivery|freight|packing|packaging|convenience(\s+fee)?|cod|cash\s+on\s+delivery|discount|coupon|offer|promotion|promo|gst|tax|cgst|sgst|igst|subtotal|grand\s+total|total|round\s*off|amount\s+payable|amount\s+in\s+words)\b/.test(
+    t
+  );
+}
+
 function extractCustomerFromText(text: string): string {
   const t = text.trim();
   if (!t) return "";
@@ -352,6 +359,7 @@ function extractItemsHeuristic(text: string): { items: ParsedItem[]; rejected: s
     if (!qty || Number.isNaN(qty) || qty <= 0) continue;
     product = sanitiseProductFragment(product);
     if (!product) continue;
+    if (isNonProductChargeText(product)) continue;
 
     const match = findSku(product);
     if (!match) {
@@ -479,6 +487,7 @@ function extractItemsFromPdfTables(text: string): ParsedItem[] {
     if (!Number.isFinite(qty) || qty <= 0) return;
     const productStr = sanitiseProductFragment(cleanProductName(productRaw));
     if (!productStr) return;
+    if (isNonProductChargeText(productStr)) return;
 
     const match = findSku(productStr) ?? findSku(productStr.replace(/\|/g, " "));
     if (!match) return;
@@ -494,12 +503,37 @@ function extractItemsFromPdfTables(text: string): ParsedItem[] {
     const cleaned = rest.replace(/\s+/g, " ").trim();
     if (!cleaned) return null;
 
-    // Primary: last standalone integer on the row.
+    // Prefer explicit "Qty: N" whenever present.
+    const explicitQty = cleaned.match(/\bqty\b\s*[:\-]?\s*(\d{1,6})\b/i);
+    if (explicitQty?.[1]) {
+      const qty = Number(explicitQty[1]);
+      const product = cleaned.replace(explicitQty[0], "").trim();
+      if (Number.isFinite(qty) && qty > 0 && product) return { product, qty };
+    }
+
+    const ints = (cleaned.match(/\b\d{1,6}\b/g) ?? [])
+      .map((s) => Number(s))
+      .filter((n) => Number.isFinite(n));
+
+    const looksLikePrice =
+      /(?:₹|rs\.?|inr|\bmrp\b|\bprice\b|\btotal\b)/i.test(cleaned) ||
+      /\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b/.test(cleaned) ||
+      /\b\d+\.\d{2}\b/.test(cleaned);
+
+    // Primary: last standalone integer on the row, but avoid common "price-at-end" false positives.
     const atEnd = cleaned.match(/\b(\d{1,6})\s*$/);
     if (atEnd?.[1]) {
-      const qty = Number(atEnd[1]);
+      const last = Number(atEnd[1]);
+      const prev = ints.length >= 2 ? ints[ints.length - 2] : null;
+
+      const lastLooksLikePrice = looksLikePrice || (last >= 250 && prev !== null && prev > 0 && prev <= 50);
+      if (lastLooksLikePrice && prev !== null && prev > 0 && prev <= 50) {
+        const product = cleaned.replace(new RegExp(`\\b${prev}\\b\\s*\\b${last}\\b\\s*$`), "").trim();
+        if (product) return { product, qty: prev };
+      }
+
       const product = cleaned.replace(/\b(\d{1,6})\s*$/, "").trim();
-      if (Number.isFinite(qty) && qty > 0 && product) return { product, qty };
+      if (Number.isFinite(last) && last > 0 && product) return { product, qty: last };
     }
 
     // Secondary: qty appears before a known trailing token (AWB/Order Id/etc).
@@ -631,22 +665,133 @@ async function extractTextFromPdfBuffer(buffer: Buffer): Promise<string> {
   const result = await parser.getText();
   const text = typeof result === "string" ? result : String(result?.text ?? "");
 
-  let out = text.trim();
-  if (out.length >= 30) return out;
+  const pdfText = text.trim();
+  const ocrEnabled = process.env.OCR_ENABLED === "true";
+  const ocrMode = (process.env.OCR_MODE || "auto").trim().toLowerCase(); // auto | compare | combine
+  if (!ocrEnabled) return pdfText;
+  if (ocrMode === "auto" && pdfText.length >= 30) return pdfText;
 
   // Optional OCR fallback for scanned PDFs (requires a local tesseract installation).
-  if (process.env.OCR_ENABLED === "true") {
-    const ocrText = await tryOcrFirstPage(parser).catch(() => "");
-    if (ocrText.trim().length >= 30) {
-      out = `${out}\n\n${ocrText}`.trim();
+  const ocrText = (await tryOcrFirstPage(parser).catch(() => "")).trim();
+  if (!ocrText) return pdfText;
+
+  const scoreForOrder = (t: string): number => {
+    const s = t.trim();
+    if (!s) return 0;
+    let skuHits = 0;
+    for (const def of SKU_CATALOG) {
+      if (skuMentionedInText(s, def)) skuHits++;
     }
+    const name = extractCustomerFromPdfText(s);
+    const nameBonus = name && isPlausibleCustomerName(name) ? 400 : 0;
+    const digitHits = (s.match(/\d/g) ?? []).length;
+    const qtyWords = (s.match(/\b(qty|quantity|pcs|pc|nos|no\.|units)\b/gi) ?? []).length;
+    const invoiceWords = (s.match(/\b(invoice|order|awb|tracking|ship to|bill to|billing|shipping)\b/gi) ?? []).length;
+    return skuHits * 1000 + nameBonus + qtyWords * 30 + invoiceWords * 10 + digitHits + Math.min(s.length, 20_000) / 200;
+  };
+
+  if (ocrMode === "combine") {
+    const uniqLines = (input: string) =>
+      Array.from(
+        new Set(
+          input
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean)
+        )
+      ).join("\n");
+
+    const a = uniqLines(pdfText);
+    const b = uniqLines(ocrText);
+    if (!a) return b;
+    return `${a}\n\n--- OCR ---\n${b}`.trim();
   }
 
-  return out;
+  // compare (or auto fallback): choose the text that looks more "order-like"
+  const pdfScore = scoreForOrder(pdfText);
+  const ocrScore = scoreForOrder(ocrText);
+  if (TWILIO_DEBUG) {
+    console.log(`PDF text score: pdf=${pdfScore.toFixed(1)} ocr=${ocrScore.toFixed(1)} mode=${ocrMode}`);
+  }
+  if (!pdfText) return ocrText;
+  if (ocrScore > pdfScore * 1.1) return ocrText;
+  return pdfText;
+}
+
+type OcrEngine = "auto" | "easyocr" | "tesseract";
+
+function getOcrEngine(): OcrEngine {
+  const v = (process.env.OCR_ENGINE || "auto").trim().toLowerCase();
+  if (v === "easyocr" || v === "tesseract") return v;
+  return "auto";
+}
+
+async function runEasyOcrOnImageFile(inputPath: string): Promise<string> {
+  const pythonCmd = (process.env.PYTHON_CMD || "python").trim();
+  const scriptPath = path.join(process.cwd(), "scripts", "ocr_easyocr.py");
+
+  const result = await new Promise<{ code: number | null; stderr: string; stdout: string }>((resolve) => {
+    const child = spawn(pythonCmd, ["-u", scriptPath, inputPath], { windowsHide: true });
+    let stderr = "";
+    let stdout = "";
+    const timeout = setTimeout(() => {
+      try { child.kill(); } catch {}
+      resolve({ code: -1, stderr: "easyocr timeout", stdout });
+    }, 60_000);
+    child.stdout.on("data", (d) => { stdout += String(d); });
+    child.stderr.on("data", (d) => { stderr += String(d); });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ code: -1, stderr: String(err?.message ?? err), stdout });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      resolve({ code, stderr, stdout });
+    });
+  });
+
+  if (result.code !== 0) {
+    if (TWILIO_DEBUG && result.stderr) console.warn(`EasyOCR failed: ${result.stderr.slice(0, 200)}`);
+    return "";
+  }
+  return result.stdout.trim();
+}
+
+async function runTesseractOnImageFile(inputPath: string, ext: "png" | "jpg" | "jpeg"): Promise<string> {
+  const cmd = (process.env.TESSERACT_CMD || "tesseract").trim();
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "dispatchboard-ocr-"));
+  const outputBase = path.join(tmpDir, "out");
+
+  const args = [inputPath, outputBase, "-l", "eng", "--psm", "6"];
+  const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    const child = spawn(cmd, args, { windowsHide: true });
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      try { child.kill(); } catch {}
+      resolve({ code: -1, stderr: "tesseract timeout" });
+    }, 30_000);
+    child.stderr.on("data", (d) => { stderr += String(d); });
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ code: -1, stderr: String(err?.message ?? err) });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      resolve({ code, stderr });
+    });
+  });
+
+  if (result.code !== 0) {
+    if (TWILIO_DEBUG && result.stderr) console.warn(`Tesseract OCR failed: ${result.stderr.slice(0, 200)}`);
+    return "";
+  }
+
+  const outTxt = `${outputBase}.txt`;
+  const ocr = await fs.readFile(outTxt, "utf8").catch(() => "");
+  return ocr.trim();
 }
 
 async function tryOcrFirstPage(pdfParser: any): Promise<string> {
-  const cmd = (process.env.TESSERACT_CMD || "tesseract").trim();
   const screenshots = await pdfParser.getScreenshot({ first: 1, scale: 2, imageDataUrl: false, imageBuffer: true });
   const first = screenshots?.pages?.[0];
   const bytes: Uint8Array | undefined = first?.data;
@@ -654,71 +799,30 @@ async function tryOcrFirstPage(pdfParser: any): Promise<string> {
 
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "dispatchboard-ocr-"));
   const inputPng = path.join(tmpDir, "page1.png");
-  const outputBase = path.join(tmpDir, "out");
-
   await fs.writeFile(inputPng, Buffer.from(bytes));
 
-  const args = [inputPng, outputBase, "-l", "eng", "--psm", "6"];
-  const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-    const child = spawn(cmd, args, { windowsHide: true });
-    let stderr = "";
-    const timeout = setTimeout(() => {
-      try { child.kill(); } catch {}
-      resolve({ code: -1, stderr: "tesseract timeout" });
-    }, 30_000);
-    child.stderr.on("data", (d) => { stderr += String(d); });
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      resolve({ code: -1, stderr: String(err?.message ?? err) });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      resolve({ code, stderr });
-    });
-  });
+  const engine = getOcrEngine();
+  if (engine === "easyocr") return await runEasyOcrOnImageFile(inputPng);
+  if (engine === "tesseract") return await runTesseractOnImageFile(inputPng, "png");
 
-  if (result.code !== 0) {
-    if (TWILIO_DEBUG && result.stderr) console.warn(`OCR failed: ${result.stderr.slice(0, 200)}`);
-    return "";
-  }
-
-  const outTxt = `${outputBase}.txt`;
-  const ocr = await fs.readFile(outTxt, "utf8").catch(() => "");
-  return ocr;
+  // auto: try easyocr first, then tesseract
+  const easy = await runEasyOcrOnImageFile(inputPng);
+  if (easy) return easy;
+  return await runTesseractOnImageFile(inputPng, "png");
 }
 
 async function tryOcrImageBuffer(buffer: Buffer, ext: "png" | "jpg" | "jpeg"): Promise<string> {
-  const cmd = (process.env.TESSERACT_CMD || "tesseract").trim();
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "dispatchboard-ocr-"));
   const input = path.join(tmpDir, `image.${ext}`);
-  const outputBase = path.join(tmpDir, "out");
   await fs.writeFile(input, buffer);
 
-  const args = [input, outputBase, "-l", "eng", "--psm", "6"];
-  const result = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-    const child = spawn(cmd, args, { windowsHide: true });
-    let stderr = "";
-    const timeout = setTimeout(() => {
-      try { child.kill(); } catch {}
-      resolve({ code: -1, stderr: "tesseract timeout" });
-    }, 30_000);
-    child.stderr.on("data", (d) => { stderr += String(d); });
-    child.on("error", (err) => {
-      clearTimeout(timeout);
-      resolve({ code: -1, stderr: String(err?.message ?? err) });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      resolve({ code, stderr });
-    });
-  });
+  const engine = getOcrEngine();
+  if (engine === "easyocr") return await runEasyOcrOnImageFile(input);
+  if (engine === "tesseract") return await runTesseractOnImageFile(input, ext);
 
-  if (result.code !== 0) {
-    if (TWILIO_DEBUG && result.stderr) console.warn(`OCR failed: ${result.stderr.slice(0, 200)}`);
-    return "";
-  }
-  const outTxt = `${outputBase}.txt`;
-  return await fs.readFile(outTxt, "utf8").catch(() => "");
+  const easy = await runEasyOcrOnImageFile(input);
+  if (easy) return easy;
+  return await runTesseractOnImageFile(input, ext);
 }
 
 function extractItemsFromInvoicePdfText(text: string): ParsedItem[] {
@@ -760,6 +864,7 @@ function extractItemsFromInvoicePdfText(text: string): ParsedItem[] {
       : [text.slice(0, 2500)];
 
     for (const ctx of contexts) {
+      if (isNonProductChargeText(ctx)) continue;
       let qty = getQtyFromContext(ctx);
 
       // Flipkart label table rows often end with quantity and include a pipe separator.
@@ -1085,14 +1190,38 @@ interface PipelineResult {
 }
 
 async function runPipeline(rawText: string): Promise<PipelineResult> {
-  const gemini = await callGemini(rawText);
+  const text = rawText.trim();
+  const inferredPriority = inferPriority(text);
+
+  // Fast path: heuristic-only parse to avoid network latency.
+  const heuristicName = extractCustomerFromText(text);
+  const heuristic = extractItemsHeuristic(text);
+  if (heuristic.items.length > 0 && heuristicName && heuristic.rejected.length === 0) {
+    const customerName = heuristicName;
+    const validItems = heuristic.items;
+    const rejectedItems: string[] = [];
+    const confidence = 0.75;
+    const notes = "";
+    const needsReview = !isPlausibleCustomerName(customerName);
+    return {
+      customerName,
+      validItems,
+      rejectedItems,
+      priority: inferredPriority,
+      notes,
+      confidence,
+      needsReview,
+      usedFallback: true
+    };
+  }
+
+  const gemini = await callGemini(text);
   let usedFallback = !gemini;
 
   // Extract and sanitise customer name
   const rawName = gemini?.customer_name ?? "";
   let customerName = sanitiseName(rawName) || "";
   if (!customerName) {
-    const heuristicName = extractCustomerFromText(rawText);
     if (heuristicName) {
       customerName = heuristicName;
       usedFallback = true;
@@ -1101,18 +1230,22 @@ async function runPipeline(rawText: string): Promise<PipelineResult> {
 
   // Validate items
   const geminiItems = gemini?.items ?? [];
-  const { valid: validItems, rejected: fromGeminiValidation } = validateItems(rawText, geminiItems);
+  const { valid: validItems, rejected: fromGeminiValidation } = validateItems(text, geminiItems);
 
   if (validItems.length === 0) {
-    const heuristic = extractItemsHeuristic(rawText);
     if (heuristic.items.length > 0) {
       const filtered = heuristic.items.filter((it) => {
         const skuDef = SKU_CATALOG.find((d) => d.sku === it.sku);
-        return skuDef ? skuMentionedInText(rawText, skuDef) : false;
+        return skuDef ? skuMentionedInText(text, skuDef) : false;
       });
 
       if (filtered.length > 0) {
         validItems.push(...filtered);
+      } else {
+        // If we matched catalog SKUs but couldn't find "strong" keywords in the text,
+        // accept the heuristic parse but force review.
+        validItems.push(...heuristic.items);
+        usedFallback = true;
       }
 
       const filteredOut = heuristic.items.filter((it) => !filtered.some((f) => f.sku === it.sku));
@@ -1131,7 +1264,6 @@ async function runPipeline(rawText: string): Promise<PipelineResult> {
 
   // Priority: always run inference on raw text and take the stronger signal
   const geminiPriority = (gemini?.priority ?? "normal") as Priority;
-  const inferredPriority = inferPriority(rawText);
   const PRIORITY_RANK: Record<Priority, number> = { urgent: 3, high: 2, normal: 1 };
   const priority: Priority =
     PRIORITY_RANK[inferredPriority] >= PRIORITY_RANK[geminiPriority]
@@ -1594,10 +1726,8 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
   }));
   const pdfTexts = pdfRes.texts;
   const pdfHeuristic = pdfTexts.flatMap((t) => extractItemsHeuristic(t).items);
-  const pdfCatalogItems = pdfTexts.flatMap((t) => [
-    ...extractItemsFromPdfTables(t),
-    ...extractItemsFromInvoicePdfText(t),
-  ]);
+  const pdfTableItems = pdfTexts.flatMap((t) => extractItemsFromPdfTables(t));
+  const pdfInvoiceItems = pdfTexts.flatMap((t) => extractItemsFromInvoicePdfText(t));
   const pdfName = pdfTexts.map(extractCustomerFromPdfText).find(Boolean) || "";
   const missingTwilioMediaCreds = hasIncomingMedia && (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN);
   const docMeta = pdfTexts.length ? extractDocMetaFromPdfText(pdfTexts[0]) : { orderIds: [], awbs: [], invoiceNos: [] };
@@ -1630,7 +1760,7 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
     console.log(`Twilio webhook: NumMedia=${numMedia} BodyLen=${body.length}`);
     media.forEach((m, i) => console.log(`  Media${i}: ct="${m.contentType}" url=${m.hasUrl ? "(present)" : "(missing)"}`));
     console.log(
-      `PDF text pages received=${pdfTexts.length} catalogItems=${pdfCatalogItems.length} heuristicItems=${pdfHeuristic.length}`
+      `PDF text pages received=${pdfTexts.length} tableItems=${pdfTableItems.length} heuristicItems=${pdfHeuristic.length}`
     );
     if (docMeta.orderIds.length || docMeta.invoiceNos.length || docMeta.awbs.length) {
       console.log(`PDF meta: orderIds=${docMeta.orderIds.join(",")} invoiceNos=${docMeta.invoiceNos.join(",")} awbs=${docMeta.awbs.join(",")}`);
@@ -1676,18 +1806,26 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
   try {
     const bodyLooksLikeFilename = /^\s*[\w\s\-\(\)]+\.(pdf|png|jpg|jpeg)\s*$/i.test(body);
     const effectiveBody = bodyLooksLikeFilename ? "" : body;
-    const pdfCombined = pdfTexts.join("\n\n").trim();
-    const pdfForPipeline =
-      pdfCombined.length > 20_000 ? `${pdfCombined.slice(0, 20_000)}\n\n[TRUNCATED]` : pdfCombined;
-    const pipelineInput = [effectiveBody, pdfForPipeline].filter(Boolean).join("\n\n");
-    const result = await runPipeline(pipelineInput);
+    // Do NOT feed raw PDF text into the general pipeline: invoices often contain prices (e.g. "1782")
+    // that get misread as quantities. We parse PDF attachments separately and only use WA body text here.
+    const result = await runPipeline(effectiveBody);
 
-    const fromPdf = [...pdfCatalogItems, ...pdfHeuristic];
+    // Items selection rule:
+    // - If we can extract from structured PDF tables, trust that ONLY (avoid double counting).
+    // - Otherwise fall back to PDF invoice text, then heuristic text.
+    const fromPdf = pdfTableItems.length > 0 ? pdfTableItems : (pdfInvoiceItems.length > 0 ? pdfInvoiceItems : pdfHeuristic);
     if (fromPdf.length > 0) {
-      for (const it of fromPdf) {
-        const existing = result.validItems.find((v) => v.sku === it.sku);
-        if (existing) existing.qty += it.qty;
-        else result.validItems.push(it);
+      if (pdfTableItems.length > 0) {
+        result.validItems = fromPdf;
+        result.usedFallback = true;
+        result.needsReview = true;
+      } else {
+        for (const it of fromPdf) {
+          const existing = result.validItems.find((v) => v.sku === it.sku);
+          // If both WA text and PDF-derived text mention same SKU, do NOT sum (prevents 1+1=2 on invoices).
+          if (existing) existing.qty = Math.max(existing.qty, it.qty);
+          else result.validItems.push(it);
+        }
       }
     }
 
@@ -1698,7 +1836,7 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
 
     // If we successfully extracted items from an attached PDF/table, don't block the order
     // due to "rejectedItems" coming from an unreliable text-only parse.
-    if (pdfCatalogItems.length > 0) {
+    if (pdfTableItems.length > 0) {
       // For PDF orders, trust our catalog-mapped extraction over any AI-derived rejections.
       result.usedFallback = true;
       result.needsReview = true;
@@ -1742,7 +1880,7 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
     if (docMeta.awbs.length) metaNotes.push(`AWB: ${docMeta.awbs[0]}`);
     await insertOrder(result, "whatsapp", metaNotes.length ? metaNotes.join(" | ") : undefined);
 
-    const itemsSummary = result.validItems.map((i) => `${i.qty}x ${i.product}`).join(", ");
+    const itemsSummary = result.validItems.map((i) => `${i.qty}x ${i.sku}`).join(", ");
     const priorityTag =
       result.priority === "urgent" ? " [URGENT]" :
       result.priority === "high" ? " [HIGH]" : "";
@@ -1798,7 +1936,12 @@ app.post("/api/parse-message", async (req, res) => {
 app.post("/api/parse-pdf", async (req, res) => {
   try {
     // Expect base64-encoded PDF in body: { pdf: "base64string", channel: "email" }
-    const { pdf, channel = "email" } = req.body as { pdf?: string; channel?: string };
+    const { pdf, channel = "email", items_only, compact } = req.body as {
+      pdf?: string;
+      channel?: string;
+      items_only?: boolean;
+      compact?: boolean;
+    };
     if (!pdf) return res.status(400).json({ error: "pdf (base64) is required" });
 
     const buffer = Buffer.from(pdf, "base64");
@@ -1810,36 +1953,42 @@ app.post("/api/parse-pdf", async (req, res) => {
 
     console.log("PDF text extracted:", text.slice(0, 300));
 
-    const result = await runPipeline(text);
+    // For PDFs, avoid feeding raw invoice text into the main pipeline (prices can look like quantities).
+    const tableItems = extractItemsFromPdfTables(text);
+    const invoiceTextItems = extractItemsFromInvoicePdfText(text);
+    const fallbackHeuristic = extractItemsHeuristic(text);
 
-    const tableItems = [
-      ...extractItemsFromPdfTables(text),
-      ...extractItemsFromInvoicePdfText(text),
-    ];
-    if (tableItems.length > 0) {
-      for (const it of tableItems) {
-        const existing = result.validItems.find((v) => v.sku === it.sku);
-        if (existing) existing.qty += it.qty;
-        else result.validItems.push(it);
-      }
-      result.usedFallback = true;
-      result.needsReview = true;
+    // Prefer structured table extraction; fall back to text only if no table items exist.
+    const items = tableItems.length > 0 ? tableItems : (invoiceTextItems.length > 0 ? invoiceTextItems : fallbackHeuristic.items);
+    if (items.length === 0) {
+      return res.status(422).json({
+        error: "No catalog items found in PDF",
+        unrecognised_items: fallbackHeuristic.rejected
+      });
     }
 
-    if (result.validItems.length === 0) {
-      const heuristic = extractItemsHeuristic(text);
-      if (heuristic.items.length > 0) {
-        result.validItems.push(...heuristic.items);
-        result.rejectedItems.push(...heuristic.rejected);
-        result.usedFallback = true;
-        result.needsReview = true;
-      } else {
-        return res.status(422).json({
-          error: "No catalog items found in PDF",
-          unrecognised_items: result.rejectedItems
-        });
-      }
+    if (items_only === true || compact === true) {
+      // Compact output requested: return items only (no DB insert).
+      return res.json(items.map((i) => ({ product_name: i.sku, qty: i.qty })));
     }
+
+    const customerFromPdf = extractCustomerFromPdfText(text);
+    const customerName = customerFromPdf || "Unknown";
+    const priority = inferPriority(text);
+    const notes = "Parsed from PDF";
+    const rejectedItems = tableItems.length > 0 ? [] : fallbackHeuristic.rejected;
+    const needsReview = !customerFromPdf || !isPlausibleCustomerName(customerName) || tableItems.length === 0;
+
+    const result: PipelineResult = {
+      customerName,
+      validItems: items,
+      rejectedItems,
+      priority,
+      notes,
+      confidence: 0.6,
+      needsReview,
+      usedFallback: true
+    };
 
     const orderId = await insertOrder(result, channel);
     return res.json({
