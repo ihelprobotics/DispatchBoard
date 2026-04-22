@@ -528,14 +528,13 @@ export function Board({ tvMode }: { tvMode: boolean }) {
             const { error: e } = await supabase.from("orders")
               .update({ payment_status: "paid", status: "fulfillment" }).eq("id", action.orderId);
             if (e) throw e;
+            await notifyStatusChange({ order_id: action.orderId, new_status: "fulfillment" });
           }
           if (action.type === "update_status") {
             const { error: e } = await supabase.from("orders")
               .update({ status: action.status }).eq("id", action.orderId);
             if (e) throw e;
-            if (action.status === "shipped" || action.status === "done") {
-              await notifyStatusChange({ order_id: action.orderId, new_status: action.status });
-            }
+            await notifyStatusChange({ order_id: action.orderId, new_status: action.status });
           }
           if (action.type === "ship_partial") {
             const { error: e } = await supabase.rpc("ship_partial", {
@@ -574,6 +573,7 @@ export function Board({ tvMode }: { tvMode: boolean }) {
     const { error: e } = await supabase.from("orders")
       .update({ payment_status: "paid", status: "fulfillment" }).eq("id", orderId);
     if (e) { enqueue({ type: "mark_paid", orderId }); setError("Offline — queued."); return; }
+    await notifyStatusChange({ order_id: orderId, new_status: "fulfillment" });
     reload();
   };
 

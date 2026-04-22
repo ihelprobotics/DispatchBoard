@@ -309,7 +309,7 @@ function extractItemsHeuristic(text: string): { items: ParsedItem[]; rejected: s
   // - "30 TM 803+ 5 TM-Display for Jai"
   // - "30 TM 803+, 5 TM-Display for Jai"
   const groupRe =
-    /(\d{1,6})\s*(?:x|nos|no\.|pcs|pc|units)?\s+(.+?)(?=(?:\s+\d{1,6}\s*(?:x|nos|no\.|pcs|pc|units)?\s+)|$)/gi;
+    /(\d{1,6})\s*(?:x|\*|nos|no\.|pcs|pc|units)?\s+(.+?)(?=(?:\s+\d{1,6}\s*(?:x|\*|nos|no\.|pcs|pc|units)?\s+)|$)/gi;
 
   const fragments: string[] = [];
   for (const m of text.matchAll(groupRe)) {
@@ -335,12 +335,12 @@ function extractItemsHeuristic(text: string): { items: ParsedItem[]; rejected: s
     let qty: number | null = null;
     let product = "";
 
-    const m1 = fragment.match(/^\s*(\d{1,6})\s*(?:x|nos|no\.|pcs|pc|units)?\s+(.*)$/i);
+    const m1 = fragment.match(/^\s*(\d{1,6})\s*(?:x|\*|nos|no\.|pcs|pc|units)?\s+(.*)$/i);
     if (m1) {
       qty = Number(m1[1]);
       product = m1[2] ?? "";
     } else {
-      const m2 = fragment.match(/^(.*\S)\s+(\d{1,6})\s*(?:x|nos|no\.|pcs|pc|units)?\s*$/i);
+      const m2 = fragment.match(/^(.*\S)\s+(\d{1,6})\s*(?:x|\*|nos|no\.|pcs|pc|units)?\s*$/i);
       if (m2) {
         product = m2[1] ?? "";
         qty = Number(m2[2]);
@@ -373,6 +373,18 @@ function extractItemsHeuristic(text: string): { items: ParsedItem[]; rejected: s
   }
 
   return { items, rejected: Array.from(new Set(rejected)) };
+}
+
+function extractSkuOnlyItems(text: string): ParsedItem[] {
+  const source = norm(text);
+  if (!source) return [];
+  const out: ParsedItem[] = [];
+  for (const def of SKU_CATALOG) {
+    if (skuMentionedInText(source, def)) {
+      out.push({ sku: def.sku, product: def.instrument, qty: 1 });
+    }
+  }
+  return out;
 }
 
 function extractCustomerFromPdfText(text: string): string {
@@ -1258,6 +1270,15 @@ async function runPipeline(rawText: string): Promise<PipelineResult> {
     }
   }
 
+  // If nothing matched (common: user sends only a SKU/product name with no qty), accept SKU-only with qty=1.
+  if (validItems.length === 0) {
+    const skuOnly = extractSkuOnlyItems(text);
+    if (skuOnly.length > 0) {
+      validItems.push(...skuOnly);
+      usedFallback = true;
+    }
+  }
+
   // Also collect what Gemini itself flagged as unrecognised
   const alsoRejected = (gemini?.unrecognised_items ?? []).filter(Boolean);
   const rejectedItems = [...new Set([...fromGeminiValidation, ...alsoRejected])];
@@ -1366,6 +1387,17 @@ app.get("/health", (_req, res) =>
 );
 
 app.get("/", (_req, res) => res.type("text/plain").send("ok"));
+
+app.get("/api/catalog", (_req, res) => {
+  res.json(
+    SKU_CATALOG.map((d) => ({
+      sku: d.sku,
+      instrument: d.instrument,
+      description: d.description,
+      aliases: d.aliases ?? []
+    }))
+  );
+});
 
 /* ── Twilio WhatsApp Webhook ── */
 app.post("/api/_twilio-webhook-old", async (req, res) => {
@@ -1896,19 +1928,14 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
     }
 
     if (!result.customerName) {
-      return xmlReply(
-        `⚠️ Could not identify the customer name.\n` +
-        `Please end your message with "for [Customer Name]".\n` +
-        `Example: "50 TM-803-PLUS for Ravi Electronics"`
-      );
-    }
-
-    if (!isPlausibleCustomerName(result.customerName)) {
-      return xmlReply(
-        `⚠️ Customer name looks incomplete.\n` +
-        `Please send the full customer/company name.\n` +
-        `Example: "50 TM-803-PLUS for Ravi Electronics"`
-      );
+      // Don't block the order — fall back to the WhatsApp display name/number and flag for review.
+      result.customerName = sanitiseName(profileName) || maskPhone(from) || "WhatsApp Customer";
+      result.usedFallback = true;
+      result.needsReview = true;
+    } else if (!isPlausibleCustomerName(result.customerName)) {
+      // Keep order, but force review.
+      result.usedFallback = true;
+      result.needsReview = true;
     }
 
     const metaNotes: string[] = [];
@@ -1957,14 +1984,9 @@ app.post("/api/notify-status-change", async (req, res) => {
   const prev = String(prev_status || "").trim().toLowerCase();
   const next = String(new_status || "").trim().toLowerCase();
 
-  const isShipmentTransition =
-    next === "shipped" && prev !== "shipped";
-  const isDoneTransition =
-    next === "done" && prev !== "done";
-
-  if (!isShipmentTransition && !isDoneTransition) {
-    return res.json({ ok: true, skipped: "transition_not_notified" });
-  }
+  const allowed = new Set(["new", "payment", "fulfillment", "shipped", "done"]);
+  if (!allowed.has(next)) return res.status(400).json({ ok: false, error: "invalid new_status" });
+  if (prev && !allowed.has(prev)) return res.status(400).json({ ok: false, error: "invalid prev_status" });
 
   const client = await pool.connect();
   try {
@@ -1983,17 +2005,29 @@ app.post("/api/notify-status-change", async (req, res) => {
 
     const customerName = String(row.customer_name || "").trim() || "Customer";
 
-    let message = "";
-    if (isShipmentTransition) {
+    const statusLabel: Record<string, string> = {
+      new: "New",
+      payment: "Payment",
+      fulfillment: "Fulfillment",
+      shipped: "Shipment",
+      done: "Done"
+    };
+
+    const orderShort = String(order_id).slice(-6);
+    const movedText =
+      prev && prev !== next ? `moved from ${statusLabel[prev]} → ${statusLabel[next]}` : `is now ${statusLabel[next]}`;
+
+    const parts: string[] = [`🔔 Update: Order ${orderShort} for ${customerName} ${movedText}.`];
+    if (next === "shipped") {
       const awbStr = (awb || "").trim();
       const courierStr = (courier || "").trim();
-      const parts = [`📦 Update: Your order for ${customerName} is now in Shipment.`];
       if (awbStr) parts.push(`AWB: ${awbStr}`);
       if (courierStr) parts.push(`Courier: ${courierStr}`);
-      message = parts.join("\n");
-    } else if (isDoneTransition) {
-      message = `✅ Update: Your order for ${customerName} is marked Done. Thank you.`;
     }
+    if (next === "done") {
+      parts.push("Thank you.");
+    }
+    const message = parts.join("\n");
 
     if (!message) return res.json({ ok: true, skipped: "no_message" });
 
