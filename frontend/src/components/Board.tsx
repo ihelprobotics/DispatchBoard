@@ -567,24 +567,61 @@ export function Board({ tvMode }: { tvMode: boolean }) {
     setQueued(updated);
   };
 
+  const isProbablyOffline = (err?: any): boolean => {
+    if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) return true;
+    const msg = String(err?.message ?? err ?? "");
+    return /failed to fetch|networkerror|network request failed|fetch failed|load failed/i.test(msg);
+  };
+
   /* ── Actions ── */
-  const markPaid = async (orderId: string) => {
+  const markPaid = async (order: Order) => {
     setError(null);
     const { error: e } = await supabase.from("orders")
-      .update({ payment_status: "paid", status: "fulfillment" }).eq("id", orderId);
-    if (e) { enqueue({ type: "mark_paid", orderId }); setError("Offline — queued."); return; }
-    await notifyStatusChange({ order_id: orderId, new_status: "fulfillment" });
+      .update({ payment_status: "paid", status: "fulfillment" }).eq("id", order.id);
+    if (e) {
+      if (isProbablyOffline(e)) {
+        enqueue({ type: "mark_paid", orderId: order.id });
+        setError("Offline — queued.");
+      } else {
+        setError(e.message || "Failed to mark as paid.");
+      }
+      return;
+    }
+    await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: "fulfillment" });
     reload();
   };
 
   const updateStatus = async (order: Order, target: Order["status"]) => {
-    if (order.status === "payment" && order.payment_status !== "paid") {
-      setError("Payment required before advancing to fulfillment.");
+    setError(null);
+    if (order.status === "payment" && target === "fulfillment" && order.payment_status !== "paid") {
+      const ok = window.confirm('Payment is pending. Mark as "Paid" and move to Fulfillment?');
+      if (!ok) return;
+      const { error: e2 } = await supabase.from("orders")
+        .update({ payment_status: "paid", status: "fulfillment" }).eq("id", order.id);
+      if (e2) {
+        if (isProbablyOffline(e2)) {
+          enqueue({ type: "mark_paid", orderId: order.id });
+          setError("Offline — queued.");
+        } else {
+          setError(e2.message || "Failed to update status.");
+        }
+        return;
+      }
+      await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: "fulfillment" });
+      reload();
       return;
     }
-    setError(null);
+
     const { error: e } = await supabase.from("orders").update({ status: target }).eq("id", order.id);
-    if (e) { enqueue({ type: "update_status", orderId: order.id, status: target }); setError("Offline — queued."); return; }
+    if (e) {
+      if (isProbablyOffline(e)) {
+        enqueue({ type: "update_status", orderId: order.id, status: target });
+        setError("Offline — queued.");
+      } else {
+        setError(e.message || "Failed to update status.");
+      }
+      return;
+    }
     if (target === "shipped" || target === "done") {
       await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: target });
     }
@@ -611,8 +648,12 @@ export function Board({ tvMode }: { tvMode: boolean }) {
       p_courier: fulfillment.courier || null,
     });
     if (e) {
-      enqueue({ type: "ship_partial", payload: { orderId: fulfillment.order.id, items, awb: fulfillment.awb || null, courier: fulfillment.courier || null } });
-      setError("Offline — queued fulfillment.");
+      if (isProbablyOffline(e)) {
+        enqueue({ type: "ship_partial", payload: { orderId: fulfillment.order.id, items, awb: fulfillment.awb || null, courier: fulfillment.courier || null } });
+        setError("Offline — queued fulfillment.");
+      } else {
+        setError(e.message || "Failed to create shipment.");
+      }
       return;
     }
     await notifyStatusChange({
@@ -954,7 +995,7 @@ export function Board({ tvMode }: { tvMode: boolean }) {
                       tvMode={tvMode}
                       onMoveBack={() => updateStatus(card, prevStatus(card.status))}
                       onMoveForward={() => updateStatus(card, nextStatus(card.status))}
-                      onMarkPaid={() => markPaid(card.id)}
+                      onMarkPaid={() => markPaid(card)}
                       onOpenFulfillment={() => openFulfillment(card)}
                       onOpenHistory={() => openHistory(card)}
                       onMarkReviewed={() => markReviewed(card.id)}
