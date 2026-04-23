@@ -2005,6 +2005,24 @@ app.post("/api/notify-status-change", async (req, res) => {
 
     const customerName = String(row.customer_name || "").trim() || "Customer";
 
+    const itemsRes = await client.query(
+      `select product_name, qty_ordered
+       from order_items
+       where order_id = $1
+       order by id asc`,
+      [order_id]
+    );
+    const itemLines = (itemsRes.rows ?? [])
+      .map((r: any) => {
+        const qty = Number(r.qty_ordered ?? 0);
+        const name = String(r.product_name ?? "").trim();
+        if (!name || !Number.isFinite(qty) || qty <= 0) return "";
+        const match = findSku(name);
+        const label = match?.sku ? match.sku : name;
+        return `- ${qty} x ${label}`;
+      })
+      .filter(Boolean);
+
     const statusLabel: Record<string, string> = {
       new: "New",
       payment: "Payment",
@@ -2018,6 +2036,7 @@ app.post("/api/notify-status-change", async (req, res) => {
       prev && prev !== next ? `moved from ${statusLabel[prev]} → ${statusLabel[next]}` : `is now ${statusLabel[next]}`;
 
     const parts: string[] = [`🔔 Update: Order ${orderShort} for ${customerName} ${movedText}.`];
+    if (itemLines.length) parts.push(itemLines.join("\n"));
     if (next === "shipped") {
       const awbStr = (awb || "").trim();
       const courierStr = (courier || "").trim();
@@ -2032,7 +2051,8 @@ app.post("/api/notify-status-change", async (req, res) => {
     if (!message) return res.json({ ok: true, skipped: "no_message" });
 
     const sent = await sendWhatsAppMessage(to, message);
-    return res.json({ ok: sent });
+    console.log(`Notify WA: order=${orderShort} to=${maskPhone(to)} status=${next} sent=${sent}`);
+    return res.json({ ok: sent, to, status: next });
   } catch (err) {
     console.error("notify-status-change error:", err);
     return res.status(500).json({ ok: false, error: "internal error" });

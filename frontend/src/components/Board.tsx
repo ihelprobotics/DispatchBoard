@@ -622,9 +622,7 @@ export function Board({ tvMode }: { tvMode: boolean }) {
       }
       return;
     }
-    if (target === "shipped" || target === "done") {
-      await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: target });
-    }
+    await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: target });
     reload();
   };
 
