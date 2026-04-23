@@ -1489,9 +1489,11 @@ app.post("/api/_twilio-webhook-old", async (req, res) => {
 const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || process.env.TWILIO_AUTH || "").trim();
 const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || process.env.TWILIO_SID || "").trim();
 const TWILIO_WHATSAPP_FROM = (process.env.TWILIO_WHATSAPP_FROM || "").trim(); // e.g. "whatsapp:+14155238886"
+const WHATSAPP_NOTIFY_FALLBACK_TO = (process.env.WHATSAPP_NOTIFY_FALLBACK_TO || "").trim(); // e.g. "whatsapp:+9199..."
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").trim().replace(/\/+$/, "");
 const TWILIO_DEBUG = process.env.TWILIO_DEBUG === "true";
 const DEBUG_ENDPOINTS = process.env.DEBUG_ENDPOINTS === "true";
+const DEBUG_API_KEY = (process.env.DEBUG_API_KEY || "").trim();
 
 type TwilioWebhookDebug = {
   at: string;
@@ -1536,20 +1538,59 @@ function logChatLine(who: string, message: string, at: Date = new Date()) {
 
 function extractWhatsAppFromNotes(notes: string | null | undefined): string {
   const n = String(notes || "");
-  const m = n.match(/\bWA_FROM\s*[:=]\s*(whatsapp:\+\d{6,16})\b/i);
-  return m?.[1] ? m[1] : "";
+  const m = n.match(/\bWA_FROM\s*[:=]\s*((?:whatsapp:)?\+\d{6,16})\b/i);
+  if (!m?.[1]) return "";
+  const raw = m[1].trim();
+  return raw.toLowerCase().startsWith("whatsapp:") ? raw : `whatsapp:${raw}`;
 }
 
-async function sendWhatsAppMessage(to: string, body: string): Promise<boolean> {
-  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_FROM) return false;
-  const dest = (to || "").trim();
-  if (!dest) return false;
+function extractWhatsAppToFromNotes(notes: string | null | undefined): string {
+  const n = String(notes || "");
+  const m = n.match(/\bWA_TO\s*[:=]\s*((?:whatsapp:)?\+\d{6,16})\b/i);
+  if (!m?.[1]) return "";
+  const raw = m[1].trim();
+  return raw.toLowerCase().startsWith("whatsapp:") ? raw : `whatsapp:${raw}`;
+}
 
+type WhatsAppSendResult =
+  | { ok: true; sid?: string }
+  | { ok: false; error: "missing_config"; missing: string[] }
+  | { ok: false; error: "invalid_to"; to: string }
+  | { ok: false; error: "http_error"; status: number; detail: string };
+
+function normalizeWhatsAppAddress(input: string): string {
+  const raw = String(input || "").trim();
+  if (!raw) return "";
+  if (/^whatsapp:\+\d{6,16}$/i.test(raw)) return raw;
+  if (/^\+\d{6,16}$/.test(raw)) return `whatsapp:${raw}`;
+  return raw; // leave as-is for debugging
+}
+
+function normalizeWhatsAppFrom(input: string): string {
+  const raw = String(input || "").trim();
+  if (!raw) return "";
+  if (/^whatsapp:\+\d{6,16}$/i.test(raw)) return raw;
+  if (/^\+\d{6,16}$/.test(raw)) return `whatsapp:${raw}`;
+  return raw;
+}
+
+async function sendWhatsAppMessage(to: string, body: string, opts?: { from?: string }): Promise<WhatsAppSendResult> {
+  const missing: string[] = [];
+  if (!TWILIO_ACCOUNT_SID) missing.push("TWILIO_ACCOUNT_SID");
+  if (!TWILIO_AUTH_TOKEN) missing.push("TWILIO_AUTH_TOKEN");
+  const fromCandidate = String(opts?.from || TWILIO_WHATSAPP_FROM || "").trim();
+  if (!fromCandidate) missing.push("TWILIO_WHATSAPP_FROM");
+  if (missing.length) return { ok: false, error: "missing_config", missing };
+
+  const dest = normalizeWhatsAppAddress(to);
+  if (!/^whatsapp:\+\d{6,16}$/i.test(dest)) return { ok: false, error: "invalid_to", to: dest };
+
+  const from = normalizeWhatsAppFrom(fromCandidate);
   const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
   const params = new URLSearchParams();
   params.set("To", dest);
-  params.set("From", TWILIO_WHATSAPP_FROM);
-  params.set("Body", body);
+  params.set("From", from);
+  params.set("Body", String(body || ""));
 
   const res = await fetchWithTimeout(
     `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
@@ -1563,11 +1604,20 @@ async function sendWhatsAppMessage(to: string, body: string): Promise<boolean> {
     },
     15_000
   );
+
   if (!res.ok) {
-    if (TWILIO_DEBUG) console.warn(`Twilio send failed: HTTP ${res.status}`);
-    return false;
+    const detailRaw = await res.text().catch(() => "");
+    const detail = (detailRaw || "").slice(0, 1200);
+    return { ok: false, error: "http_error", status: res.status, detail };
   }
-  return true;
+
+  try {
+    const j = (await res.json()) as any;
+    const sid = typeof j?.sid === "string" ? j.sid : undefined;
+    return { ok: true, sid };
+  } catch {
+    return { ok: true };
+  }
 }
 
 function buildTwilioSignature(authToken: string, url: string, params: Record<string, string>): string {
@@ -1773,6 +1823,7 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
 
   const body = String(req.body?.Body ?? "").trim();
   const from = String(req.body?.From ?? "");
+  const waTo = String(req.body?.To ?? "");
   const profileName = String(req.body?.ProfileName ?? "").trim();
   const displayName = profileName || maskPhone(from) || "WhatsApp";
 
@@ -1812,8 +1863,10 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
   };
 
   const catalogSkuList = SKU_CATALOG
-    .map((d) => `${d.instrument} (${d.sku})`)
-    .join(", ");
+    .slice()
+    .sort((a, b) => String(a.sku).localeCompare(String(b.sku)))
+    .map((d) => `- ${d.sku} — ${d.instrument}`)
+    .join("\n");
 
   logChatLine(displayName, body || (hasIncomingMedia ? "[media]" : "[no text]"));
 
@@ -1853,7 +1906,8 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
     return xmlReply(
       `⚠️ We could not parse that message.\n` +
       `Format: "50 TM-803-PLUS, 2 TM-801-TA for Shyam Sundar"\n` +
-      `Available catalog SKUs: ${catalogSkuList}.`
+      `Tip: qty defaults to 1 if you omit it.\n` +
+      `Available SKUs:\n${catalogSkuList}`
     );
   }
 
@@ -1916,14 +1970,16 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
       return xmlReply(
         `⚠️ We could not parse that message. Please format orders as:\n` +
         `Format: "50 TM-803-PLUS, 2 TM-801-TA for Shyam Sundar"\n` +
-        `Available catalog SKUs: ${catalogSkuList}.`
+        `Tip: qty defaults to 1 if you omit it.\n` +
+        `Available SKUs:\n${catalogSkuList}`
       );
     }
 
     if (result.rejectedItems.length > 0) {
       return xmlReply(
         `⚠️ We only accept catalog SKUs. Unknown items: ${result.rejectedItems.join(", ")}.\n` +
-        `Please resend using published products like ${CATALOG_EXAMPLES}.`
+        `Please resend using SKU codes.\n` +
+        `Available SKUs:\n${catalogSkuList}`
       );
     }
 
@@ -1943,6 +1999,7 @@ async function handleTwilioWebhook(req: express.Request, res: express.Response) 
     if (docMeta.invoiceNos.length) metaNotes.push(`Invoice: ${docMeta.invoiceNos[0]}`);
     if (docMeta.awbs.length) metaNotes.push(`AWB: ${docMeta.awbs[0]}`);
     if (from) metaNotes.push(`WA_FROM:${from}`);
+    if (waTo) metaNotes.push(`WA_TO:${waTo}`);
     if (profileName) metaNotes.push(`WA_NAME:${profileName}`);
     await insertOrder(result, "whatsapp", metaNotes.length ? metaNotes.join(" | ") : undefined);
 
@@ -1968,6 +2025,19 @@ app.post("/", handleTwilioWebhook);
 if (DEBUG_ENDPOINTS) {
   app.get("/debug/last-twilio-webhook", (_req, res) => {
     res.json({ ok: true, last: lastTwilioWebhookDebug });
+  });
+
+  app.post("/debug/test-send-wa", async (req, res) => {
+    const key = String(req.header("x-debug-key") || "");
+    if (!DEBUG_API_KEY || key !== DEBUG_API_KEY) return res.status(403).json({ ok: false, error: "forbidden" });
+    const { to, body, from } = req.body as { to?: string; body?: string; from?: string };
+    if (!to || !body) return res.status(400).json({ ok: false, error: "to and body are required" });
+    try {
+      const result = await sendWhatsAppMessage(String(to), String(body), { from: from ? String(from) : undefined });
+      return res.json({ ok: result.ok, result });
+    } catch (err: any) {
+      return res.status(500).json({ ok: false, error: String(err?.message ?? err ?? "error") });
+    }
   });
 }
 
@@ -2000,7 +2070,8 @@ app.post("/api/notify-status-change", async (req, res) => {
     const row = q.rows[0] as any;
     if (!row) return res.status(404).json({ ok: false, error: "order not found" });
 
-    const to = extractWhatsAppFromNotes(row.notes);
+    const fromNotes = extractWhatsAppFromNotes(row.notes);
+    const to = fromNotes || normalizeWhatsAppAddress(WHATSAPP_NOTIFY_FALLBACK_TO);
     if (!to) return res.json({ ok: true, skipped: "no_whatsapp_contact" });
 
     const customerName = String(row.customer_name || "").trim() || "Customer";
@@ -2033,9 +2104,17 @@ app.post("/api/notify-status-change", async (req, res) => {
 
     const orderShort = String(order_id).slice(-6);
     const movedText =
-      prev && prev !== next ? `moved from ${statusLabel[prev]} → ${statusLabel[next]}` : `is now ${statusLabel[next]}`;
+      prev && prev !== next ? `moved from ${statusLabel[prev]} -> ${statusLabel[next]}` : `is now ${statusLabel[next]}`;
 
-    const parts: string[] = [`🔔 Update: Order ${orderShort} for ${customerName} ${movedText}.`];
+    const header =
+      next === "shipped"
+        ? `📦 Order shipped: ${order_id} | customer: "${customerName}"`
+        : next === "done"
+          ? `✅ Order delivered: ${order_id} | customer: "${customerName}"`
+          : `🔔 Order update: ${order_id} | customer: "${customerName}"`;
+
+    const parts: string[] = [header];
+    if (prev) parts.push(`Status: ${movedText}`);
     if (itemLines.length) parts.push(itemLines.join("\n"));
     if (next === "shipped") {
       const awbStr = (awb || "").trim();
@@ -2050,9 +2129,20 @@ app.post("/api/notify-status-change", async (req, res) => {
 
     if (!message) return res.json({ ok: true, skipped: "no_message" });
 
-    const sent = await sendWhatsAppMessage(to, message);
-    console.log(`Notify WA: order=${orderShort} to=${maskPhone(to)} status=${next} sent=${sent}`);
-    return res.json({ ok: sent, to, status: next });
+    const fromOverride = extractWhatsAppToFromNotes(row.notes);
+    const result = await sendWhatsAppMessage(to, message, { from: fromOverride || undefined });
+    const sent = result.ok;
+    const baseLog = `Notify WA: order=${orderShort} to=${maskPhone(to)} status=${next} sent=${sent}`;
+    if (!sent) {
+      if (result.error === "missing_config") console.warn(`${baseLog} reason=missing_config missing=${result.missing.join(",")}`);
+      else if (result.error === "invalid_to") console.warn(`${baseLog} reason=invalid_to to=${result.to}`);
+      else if (result.error === "http_error") console.warn(`${baseLog} reason=http_error http=${result.status} detail=${String(result.detail).slice(0, 300)}`);
+      else console.warn(`${baseLog} reason=unknown`);
+    } else {
+      console.log(`${baseLog}${result.sid ? ` sid=${result.sid}` : ""}`);
+    }
+
+    return res.json({ ok: sent, to, status: next, twilio: result.ok ? { sid: result.sid } : result });
   } catch (err) {
     console.error("notify-status-change error:", err);
     return res.status(500).json({ ok: false, error: "internal error" });

@@ -1,7 +1,6 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useDrag } from "@use-gesture/react";
 import { supabase } from "../lib/supabaseClient";
 
 /* ============================================================
@@ -22,6 +21,7 @@ type Order = {
   status: "new" | "payment" | "fulfillment" | "shipped" | "done";
   payment_status: "pending" | "paid";
   needs_review: boolean;
+  created_at: string;
   notes?: string | null;
   items: OrderItem[];
 };
@@ -46,6 +46,13 @@ type ProductMapping = {
   marketplace: string;
   external_sku: string;
   product_name: string;
+};
+
+type CatalogItem = {
+  sku: string;
+  instrument: string;
+  description: string;
+  aliases: string[];
 };
 
 type Profile = {
@@ -86,8 +93,6 @@ const COLUMNS = [
   { key: "done",        label: "Done" },
 ] as const;
 
-const STATUS_ORDER = ["new", "payment", "fulfillment", "shipped", "done"] as const;
-
 const QUEUE_KEY = "dispatchboard_queue";
 
 const SAMPLE_CARDS: Order[] = [
@@ -98,6 +103,7 @@ const SAMPLE_CARDS: Order[] = [
     status: "new",
     payment_status: "pending",
     needs_review: false,
+    created_at: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
     items: [
       { product_name: "TM 803+ Sensor", qty_ordered: 50 },
       { product_name: "890 HTM", qty_ordered: 10 },
@@ -110,6 +116,7 @@ const SAMPLE_CARDS: Order[] = [
     status: "fulfillment",
     payment_status: "paid",
     needs_review: false,
+    created_at: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
     items: [{ product_name: "TM 804 Sensor alone", qty_ordered: 20 }],
   },
 ];
@@ -174,18 +181,14 @@ const getPriorityStyles = (p: Order["priority"]) =>
   p === "high"   ? "bg-amber-500 text-white" :
                    "bg-mint text-ink";
 
-const canMoveForward = (order: Order) =>
-  order.status !== "done" &&
-  !(order.status === "payment" && order.payment_status !== "paid");
-
-const nextStatus = (s: Order["status"]) => {
-  const i = STATUS_ORDER.indexOf(s);
-  return STATUS_ORDER[Math.min(i + 1, STATUS_ORDER.length - 1)];
-};
-
-const prevStatus = (s: Order["status"]) => {
-  const i = STATUS_ORDER.indexOf(s);
-  return STATUS_ORDER[Math.max(i - 1, 0)];
+const PRIORITY_RANK: Record<Order["priority"], number> = { urgent: 0, high: 1, normal: 2 };
+const compareOrders = (a: Order, b: Order) => {
+  const byPriority = PRIORITY_RANK[a.priority] - PRIORITY_RANK[b.priority];
+  if (byPriority !== 0) return byPriority;
+  const ta = Date.parse(a.created_at || "") || 0;
+  const tb = Date.parse(b.created_at || "") || 0;
+  if (ta !== tb) return ta - tb; // first come first serve
+  return a.id.localeCompare(b.id);
 };
 
 const emptyNewOrder = (): NewOrderState => ({
@@ -236,6 +239,7 @@ const useOrders = (tvMode: boolean) => {
           payment_status: o.payment_status,
           needs_review: o.needs_review ?? false,
           suffix: o.suffix ?? null,
+          created_at: o.created_at ?? new Date().toISOString(),
           notes: (() => {
             const raw = (o.notes ?? "") as string;
             if (!raw) return null;
@@ -321,29 +325,28 @@ const useOrders = (tvMode: boolean) => {
 
 function OrderCard({
   card, tvMode,
-  onMoveBack, onMoveForward, onMarkPaid,
+  onMarkPaid,
   onOpenFulfillment, onOpenHistory, onMarkReviewed,
   isAdmin, onDelete,
 }: {
   card: Order; tvMode: boolean;
-  onMoveBack: () => void; onMoveForward: () => void; onMarkPaid: () => void;
+  onMarkPaid: () => void;
   onOpenFulfillment: () => void; onOpenHistory: () => void; onMarkReviewed: () => void;
   isAdmin: boolean; onDelete: () => void;
 }) {
-  const bind = useDrag(
-    ({ last, movement: [mx], swipe: [sx] }) => {
-      if (!last || tvMode) return;
-      if (sx === 1  || mx >  80) onMoveBack();
-      if (sx === -1 || mx < -80) onMoveForward();
-    },
-    { filterTaps: true }
-  );
+  const lockedDone = card.status === "done";
+  const draggable = !tvMode && !lockedDone && card.status !== "fulfillment";
 
   const isUrgent = card.priority === "urgent";
 
   return (
     <div
-      {...bind()}
+      draggable={draggable}
+      onDragStart={(e) => {
+        if (!draggable) return;
+        e.dataTransfer.setData("text/plain", card.id);
+        e.dataTransfer.effectAllowed = "move";
+      }}
       className={`rounded-2xl border bg-white p-4 shadow-sm transition-shadow ${
         isUrgent ? "border-red-300 ring-1 ring-red-200" : "border-ink/10"
       }`}
@@ -426,16 +429,16 @@ function OrderCard({
           onClick={onOpenHistory}
         >View shipments</button>
 
-        <div className="flex gap-2 text-xs">
+        <div className="hidden">
           <button
             className="w-full rounded-xl border border-ink/10 px-2 py-2 font-semibold disabled:opacity-30 hover:bg-paper"
-            onClick={onMoveBack}
-            disabled={card.status === "new" || tvMode}
+            onClick={() => {}}
+            disabled={true}
           >← Back</button>
           <button
             className="w-full rounded-xl border border-ink/10 px-2 py-2 font-semibold disabled:opacity-30 hover:bg-paper"
-            onClick={onMoveForward}
-            disabled={!canMoveForward(card) || tvMode}
+            onClick={() => {}}
+            disabled={true}
           >Forward →</button>
         </div>
       </div>
@@ -468,8 +471,23 @@ export function Board({ tvMode }: { tvMode: boolean }) {
   const [mappingForm,   setMappingForm]   = useState({ marketplace: "", external_sku: "", product_name: "" });
   const [isAdmin,       setIsAdmin]       = useState(true);
   const [rawImport,     setRawImport]     = useState<{ text: string; parsing: boolean } | null>(null);
+  const [catalog,       setCatalog]       = useState<CatalogItem[]>([]);
 
   const columnRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const url = (process.env.NEXT_PUBLIC_INTAKE_API_URL ?? "http://localhost:4000");
+        const res = await fetch(`${url}/api/catalog`);
+        if (!res.ok) return;
+        const data = (await res.json()) as CatalogItem[];
+        setCatalog(Array.isArray(data) ? data : []);
+      } catch {
+        setCatalog([]);
+      }
+    })();
+  }, []);
 
   /* ── Role init ── */
   useEffect(() => {
@@ -506,13 +524,37 @@ export function Board({ tvMode }: { tvMode: boolean }) {
   const notifyStatusChange = useCallback(async (payload: { order_id: string; prev_status?: Order["status"]; new_status: Order["status"]; awb?: string; courier?: string }) => {
     try {
       const url = (process.env.NEXT_PUBLIC_INTAKE_API_URL ?? "http://localhost:4000");
-      await fetch(`${url}/api/notify-status-change`, {
+      const res = await fetch(`${url}/api/notify-status-change`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      const json = await res.json().catch(() => null as any);
+      if (!res.ok || (json && json.ok === false)) {
+        let detail = "";
+        const t = json?.twilio;
+        if (t?.error === "missing_config") detail = `missing: ${String(t.missing || []).toString()}`;
+        if (t?.error === "invalid_to") detail = `invalid_to: ${String(t.to || "")}`;
+        if (t?.error === "http_error") {
+          const raw = String(t.detail || "");
+          try {
+            const parsed = JSON.parse(raw);
+            const msg = parsed?.message || parsed?.error?.message;
+            detail = msg ? String(msg) : raw.slice(0, 180);
+          } catch {
+            detail = raw.slice(0, 180);
+          }
+          detail = `twilio_http=${t.status} ${detail}`.trim();
+        }
+
+        console.warn("WhatsApp notify failed:", { http: res.status, payload, response: json });
+        if (detail) setError(`WhatsApp notification failed: ${detail}`);
+        return false;
+      }
+      return true;
     } catch {
       // best-effort
+      return false;
     }
   }, []);
 
@@ -593,6 +635,19 @@ export function Board({ tvMode }: { tvMode: boolean }) {
 
   const updateStatus = async (order: Order, target: Order["status"]) => {
     setError(null);
+    if (order.status === "done") {
+      setError("Done orders are locked (no forward/back moves).");
+      return;
+    }
+    if (order.status === "fulfillment" && target !== "fulfillment") {
+      setError('Use "Open Fulfillment" → Ship (complete/partial). Status moves to Shipped automatically.');
+      return;
+    }
+    if (target === "payment" && order.needs_review) {
+      setError('Mark the order as reviewed before moving it to Payment.');
+      return;
+    }
+    if (order.status === target) return;
     if (order.status === "payment" && target === "fulfillment" && order.payment_status !== "paid") {
       const ok = window.confirm('Payment is pending. Mark as "Paid" and move to Fulfillment?');
       if (!ok) return;
@@ -607,7 +662,8 @@ export function Board({ tvMode }: { tvMode: boolean }) {
         }
         return;
       }
-      await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: "fulfillment" });
+      const okNotify = await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: "fulfillment" });
+      if (!okNotify) setError("Status updated, but WhatsApp notification failed (check backend logs).");
       reload();
       return;
     }
@@ -622,7 +678,8 @@ export function Board({ tvMode }: { tvMode: boolean }) {
       }
       return;
     }
-    await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: target });
+    const okNotify = await notifyStatusChange({ order_id: order.id, prev_status: order.status, new_status: target });
+    if (!okNotify) setError("Status updated, but WhatsApp notification failed (check backend logs).");
     reload();
   };
 
@@ -702,6 +759,17 @@ export function Board({ tvMode }: { tvMode: boolean }) {
     if (!newOrder.customerName.trim()) { setError("Customer name is required."); return; }
     const items = newOrder.items.filter((i) => i.product_name.trim() && i.qty_ordered > 0);
     if (!items.length) { setError("Add at least one line item."); return; }
+    if (!catalog.length) { setError("Catalog not loaded yet. Please refresh and try again."); return; }
+    const allowed = new Set<string>(catalog.map((c) => c.instrument.trim()).filter(Boolean));
+    const allowedSku = new Set<string>(catalog.map((c) => c.sku.trim()).filter(Boolean));
+    const bad = items.find((i) => {
+      const p = i.product_name.trim();
+      return !(allowed.has(p) || allowedSku.has(p));
+    });
+    if (bad) {
+      setError(`Invalid product "${bad.product_name}". Only catalog products are allowed.`);
+      return;
+    }
     setError(null);
 
     const { data: existing } = await supabase
@@ -978,6 +1046,39 @@ export function Board({ tvMode }: { tvMode: boolean }) {
             <section
               key={col.key}
               className="flex h-[70vh] min-w-[220px] flex-col rounded-2xl border border-ink/10 bg-white/70 p-3"
+              onDragOver={(e) => {
+                if (tvMode) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+              }}
+              onDrop={(e) => {
+                if (tvMode) return;
+                e.preventDefault();
+                const orderId = e.dataTransfer.getData("text/plain");
+                if (!orderId) return;
+                const order = orders.find((o) => o.id === orderId);
+                if (!order) return;
+                const next: Record<Order["status"], Order["status"]> = {
+                  new: "payment",
+                  payment: "fulfillment",
+                  fulfillment: "shipped",
+                  shipped: "done",
+                  done: "done",
+                };
+                const prev: Partial<Record<Order["status"], Order["status"]>> = {
+                  payment: "new",
+                };
+
+                const isForward = col.key === next[order.status];
+                const isBackward = order.status === "payment" && col.key === prev[order.status];
+
+                if (!isForward && !isBackward) {
+                  setError("Only allowed: New→Payment, Payment→Fulfillment, Shipped→Done, and Payment→New (back).");
+                  return;
+                }
+
+                updateStatus(order, col.key);
+              }}
             >
               <div className="mb-3 flex items-center justify-between">
                 <h2 className="text-xs font-semibold uppercase tracking-widest text-ink/50">{col.label}</h2>
@@ -986,13 +1087,13 @@ export function Board({ tvMode }: { tvMode: boolean }) {
               <div className="flex-1 space-y-3 overflow-y-auto pb-2">
                 {filteredOrders
                   .filter((o) => o.status === col.key)
+                  .slice()
+                  .sort(compareOrders)
                   .map((card) => (
                     <OrderCard
                       key={card.id}
                       card={card}
                       tvMode={tvMode}
-                      onMoveBack={() => updateStatus(card, prevStatus(card.status))}
-                      onMoveForward={() => updateStatus(card, nextStatus(card.status))}
                       onMarkPaid={() => markPaid(card)}
                       onOpenFulfillment={() => openFulfillment(card)}
                       onOpenHistory={() => openHistory(card)}
@@ -1153,8 +1254,24 @@ export function Board({ tvMode }: { tvMode: boolean }) {
               <div className="mt-3 space-y-2">
                 {newOrder.items.map((item, idx) => (
                   <div key={idx} className="grid gap-2 grid-cols-[1fr_100px_70px]">
-                    <input className="rounded-xl border border-ink/10 px-3 py-2 text-sm" placeholder="Product name" value={item.product_name}
-                      onChange={(e) => setNewOrder((p) => { if (!p) return p; const its = [...p.items]; its[idx] = { ...its[idx], product_name: e.target.value }; return { ...p, items: its }; })} />
+                    <select
+                      className="rounded-xl border border-ink/10 px-3 py-2 text-sm"
+                      value={item.product_name}
+                      onChange={(e) => setNewOrder((p) => {
+                        if (!p) return p;
+                        const its = [...p.items];
+                        its[idx] = { ...its[idx], product_name: e.target.value };
+                        return { ...p, items: its };
+                      })}
+                    >
+                      <option value="">Select product (SKU)</option>
+                      {catalog
+                        .slice()
+                        .sort((a, b) => String(a.sku).localeCompare(String(b.sku)))
+                        .map((c) => (
+                          <option key={c.sku} value={c.instrument}>{c.sku} — {c.instrument}</option>
+                        ))}
+                    </select>
                     <input className="rounded-xl border border-ink/10 px-3 py-2 text-sm" type="number" min={1} value={item.qty_ordered}
                       onChange={(e) => setNewOrder((p) => { if (!p) return p; const its = [...p.items]; its[idx] = { ...its[idx], qty_ordered: Number(e.target.value || 1) }; return { ...p, items: its }; })} />
                     <button className="rounded-xl border border-ink/10 px-2 py-2 text-xs font-semibold hover:bg-red-50"
